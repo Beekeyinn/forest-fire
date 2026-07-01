@@ -18,3 +18,6 @@ data/raw/
 data/processed/
 __cache__/
 logs/
+
+# Model artifacts & rasters — regenerable from the training notebooks, too large for git
+*.tif

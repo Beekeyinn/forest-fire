@@ -1,37 +1,3 @@
-"""
-Forest Fire Susceptibility — Raw Data Downloader
-=================================================
-Study Area : Bagmati Province, Nepal  
-Period     : 2015–2026
-
-Downloads the following raw datasets:
-
-  1. NASA FIRMS     — Historical fire hotspots via FIRMS SP Archive API
-                      (free MAP_KEY required — set FIRMS_MAP_KEY in .env)
-  2. Open-Meteo     — Historical daily weather archive (free, no key)
-  3. SRTM DEM       — CGIAR 30m elevation tile (free direct download)
-  4. ESA WorldCover — 10m Land Use / Land Cover GeoTIFF (free S3)
-  5. OSM            — Road & settlement network via Overpass API (free)
-  6. WorldPop       — Nepal 100m population density raster (free)
-  7. Hansen GFC     — Global Forest Change v1.11 treecover & lossyear tiles (free GCS)
-  8. GADM           — Nepal Level-3 admin boundaries GeoJSON (free, UC Davis)
-
-Usage:
-    uv run python scripts/download_data.py               # all modules
-    uv run python scripts/download_data.py --module firms
-    uv run python scripts/download_data.py --module weather
-    uv run python scripts/download_data.py --module dem
-    uv run python scripts/download_data.py --module lulc
-    uv run python scripts/download_data.py --module osm
-    uv run python scripts/download_data.py --module worldpop
-    uv run python scripts/download_data.py --module hansen
-    uv run python scripts/download_data.py --module gadm
-
-FIRMS MAP_KEY (free registration, ~1 min):
-    https://firms.modaps.eosdis.nasa.gov/usfs/api/
-    Add to .env:  FIRMS_MAP_KEY=your_key_here
-"""
-
 import argparse
 import json
 import time
@@ -86,7 +52,7 @@ def _download_file(url: str, dest: Path, desc: str = "", timeout: int = 120) -> 
         dest.unlink()
     return False
 
-# NASA FIRMS: Historical fire hotspots via SP Archive API
+
 class FIRMSDownloader:
     """
     Products:
@@ -336,8 +302,6 @@ class WeatherDownloader:
             return combined
         return pd.DataFrame()
 
-
-# SRTM DEM: CGIAR 30m elevation tile (free, no key)
 class DEMDownloader:
     """
     Downloads SRTM 30m elevation GeoTIFF from the CGIAR-CSI public archive.
@@ -397,20 +361,9 @@ class DEMDownloader:
             except Exception as e:
                 log.error(f"  Failed to extract {name}.zip: {e}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 4 — ESA WorldCover: 10m Land Use / Land Cover (free S3)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class LULCDownloader:
     """
     Downloads ESA WorldCover 2021 v200 10m GeoTIFF from the public AWS S3 bucket.
-
-    Tiles are 3°×3° named by their lower-left corner.
-    For Kathmandu Valley (27.7°N, 85.3°E):
-      lat_tile = floor(27.55 / 3) * 3 = 27 → N27
-      lon_tile = floor(85.15 / 3) * 3 = 84 → E084
-    → ESA_WorldCover_10m_2021_v200_N27E084_Map.tif
     """
 
     S3_BASE = "https://esa-worldcover.s3.amazonaws.com/v200/2021/map/"
@@ -453,8 +406,6 @@ class LULCDownloader:
                     "  Place the downloaded .tif in data/raw/lulc/"
                 )
 
-
-# OpenStreetMap: Roads & settlements via Overpass API (free)
 
 class OSMDownloader:
     """

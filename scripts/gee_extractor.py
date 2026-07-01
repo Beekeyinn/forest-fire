@@ -1,55 +1,3 @@
-"""
-Forest Fire Susceptibility — Google Earth Engine Data Extractor
-===============================================================
-Study Area : Kathmandu Valley, Nepal
-Period     : 2015–2025 (11 years)
-
-Extracts the following datasets via the GEE Python API:
-
-  1. NDVI         — MODIS MOD13Q1 v6.1 (250m, individual 16-day composites)
-                    Every composite across the full year — ~23 per year × 11 years ≈ 253 tifs
-                    Naming: ndvi_16day_YYYY-MM-DD.tif  (date = composite start date)
-                    Output: data/raw/ndvi/ndvi_16day_YYYY-MM-DD.tif
-
-                    During feature engineering, for each fire/non-fire sample point,
-                    use the composite whose start date is closest to (and before) the
-                    sample date to get the pre-event vegetation state.
-
-  2. FIRMS        — NASA MODIS fire hotspots via GEE ImageCollection 'FIRMS'
-                    Alternative to the FIRMS MAP_KEY API (requires GCP project only)
-                    Output: data/raw/firms/firms_gee_{year}.csv (via Drive export)
-
-  3. Burned Area  — MODIS MCD64A1 v6.1 (500m, monthly burn date composites)
-                    Complements FIRMS point detections with spatial burn footprints.
-                    Band: BurnDate (DOY 1–366; 0 = unburned; 900+ = ocean/water)
-                    Output: data/raw/burned_area/mcd64a1_{year}_{month:02d}.tif
-
-Usage
------
-  # First-time authentication (opens browser OAuth flow):
-  uv run python scripts/gee_extractor.py --authenticate --project YOUR_GCP_PROJECT
-
-  # Or set GEE_PROJECT_ID in .env to skip the --project flag:
-  uv run python scripts/gee_extractor.py --authenticate
-
-  uv run python scripts/gee_extractor.py --module ndvi
-  uv run python scripts/gee_extractor.py --module firms
-  uv run python scripts/gee_extractor.py --module all
-
-Prerequisites
--------------
-  1. Sign up for GEE (free for research): https://earthengine.google.com/
-  2. Create a Google Cloud Project: https://console.cloud.google.com/
-  3. Enable the Earth Engine API in your GCP project
-  4. Add to .env:  GEE_PROJECT_ID=your-gcp-project-id
-  5. Run with --authenticate once to cache credentials
-
-GEE Dataset Catalog IDs
------------------------
-  NDVI  : MODIS/061/MOD13Q1  (250m, 16-day, from 2000-02-18)
-  FIRMS : FIRMS               (MODIS MCD14DL hotspots, ~1 km)
-"""
-
 import argparse
 import sys
 import time
@@ -59,8 +7,6 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from tqdm import tqdm
-
 from config import (
     BAGMATI_DISTRICTS,
     BBOX_COORDS,
@@ -80,25 +26,15 @@ from config import (
     START_YEAR,
     get_logger,
 )
+from tqdm import tqdm
 
 log = get_logger(__name__, "download.log")
 
-# Drive folder for oversized-export fallbacks (province-scoped).
 DRIVE_FOLDER = "ForestFire_Bagmati"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EXPORT REGION  (province polygon if available, else the bbox rectangle)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _aoi_region():
     """
     Return the ee.Geometry to export over.
-
-    Prefers the configured province polygon (GADM NAME_1) so exports are clipped
-    to Bagmati — smaller downloads and no neighbouring-province bleed.  Falls
-    back to the bbox rectangle if GADM/geopandas is unavailable.  The result is
-    cached so we read the polygon only once per run.
     """
     import ee
     global _AOI_REGION_CACHE
@@ -135,17 +71,9 @@ def _aoi_region():
     return region
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTHENTICATION
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _authenticate(project: str, force: bool = False) -> None:
     """
     Authenticate with Google Earth Engine and initialise the API.
-
-    On the first call (or when force=True) this opens a browser window for
-    OAuth2 consent; credentials are cached in ~/.config/earthengine/.
-    Subsequent calls only need ee.Initialize().
     """
     try:
         import ee
@@ -171,10 +99,6 @@ def _authenticate(project: str, force: bool = False) -> None:
         sys.exit(1)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SHARED DOWNLOAD HELPER
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _gee_download(
     image,
     region,
@@ -185,13 +109,6 @@ def _gee_download(
     drive_fallback: bool = True,
 ) -> bool:
     """
-    Download a single GEE image as a GeoTIFF via getDownloadURL().
-
-    Parameterised by `scale_m` so every extractor (NDVI 250 m, LST 1 km,
-    DEM/Sentinel-2 30 m, …) shares one implementation instead of copy-pasting
-    the request/zip-extract/retry logic.  On failure (e.g. the 32 MB direct-
-    download cap) it optionally starts a Drive export task and returns False.
-
     Returns True on a successful local save.
     """
     import ee
@@ -217,12 +134,10 @@ def _gee_download(
         return False
 
     log.info(f"    Downloading {desc or dest.name} ...")
-    MAX_SECONDS = 240          # hard per-attempt wall-clock cap — kills trickle-stalls
+    MAX_SECONDS = 240          
     RETRIES = 4
     for attempt in range(RETRIES):
         try:
-            # (connect, read) timeouts: if no chunk arrives for 60 s the read
-            # raises and we retry, instead of blocking forever on a half-open socket.
             r = requests.get(url, stream=True, timeout=(15, 60))
             r.raise_for_status()
             content_type = r.headers.get("content-type", "")
@@ -261,7 +176,6 @@ def _gee_download(
 
         except Exception as exc:
             log.warning(f"    Attempt {attempt + 1}/{RETRIES} failed: {exc}")
-            # Drop any partial file so the retry (or a later run's cache check) is clean.
             if dest.exists():
                 dest.unlink()
             if attempt < RETRIES - 1:
@@ -274,7 +188,6 @@ def _gee_download(
 
 
 def _gee_drive_export(image, region, scale_m: int, desc: str, drive_folder: str):
-    """Start a Drive export task when direct download is unavailable (e.g. >32 MB)."""
     import ee
     safe = desc.replace(" ", "_")[:100]
     task = ee.batch.Export.image.toDrive(
@@ -301,19 +214,7 @@ def _gee_download_tiled(
     require_all: bool = False,
 ) -> bool:
     """
-    Download a large image as n×n direct-download tiles, then mosaic to one GeoTIFF.
-
-    Splitting the bbox keeps every getDownloadURL request under GEE's ~50 MB cap,
-    so the result lands straight in data/raw/ with NO Drive fallback / manual step.
-    `bbox_coords` is [W, S, E, N]; tiles overlap slightly to avoid seams (the final
-    raster is resampled onto the canonical grid by feature_engineering anyway).
-
-    require_all=True: if ANY tile fails, do NOT save a partial mosaic — return False
-    and leave the good tiles in the temp dir (reused as cache on the next attempt),
-    so the caller's retry fetches only the missing tile and the file is only written
-    once all n×n tiles are present. Off by default (seasonal callers keep the old
-    best-effort behaviour); the 16-day extractor turns it on to avoid silent
-    missing-quadrant composites.
+    Download a large image as n×n direct-download tiles, then mosaic to one GeoTIFF.    
     """
     import ee
     import rasterio
@@ -326,7 +227,7 @@ def _gee_download_tiled(
 
     w, s, e, nlat = bbox_coords
     dx, dy = (e - w) / n, (nlat - s) / n
-    ov = 0.005                                   # ~0.5 km tile overlap
+    ov = 0.005                                       
     tmpdir = dest.parent / f".tiles_{desc}"
     tmpdir.mkdir(parents=True, exist_ok=True)
 
@@ -374,14 +275,9 @@ def _gee_download_tiled(
 def _modis_16day_windows(year: int):
     """
     Generate the MODIS MOD13Q1 16-day composite windows for a year.
-
-    MODIS uses fixed DOY-based periods starting Jan 1 every year, advancing by
-    16 days each time (~23 windows per year). Returns a list of
-    (start_date_str, end_date_str) tuples — fully deterministic, no GEE call.
-    Module-level so both the NDVI and the 16-day Sentinel-2 extractors share one
-    definition (and therefore land on identical, 1:1-alignable window dates).
     """
-    from datetime import date as date_cls, timedelta
+    from datetime import date as date_cls
+    from datetime import timedelta
     windows = []
     start = date_cls(year, 1, 1)
     while start.year == year:
@@ -391,54 +287,20 @@ def _modis_16day_windows(year: int):
     return windows
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 1 — NDVI via MODIS MOD13Q1
-# ─────────────────────────────────────────────────────────────────────────────
-
 class NDVIExtractor:
     """
     Downloads every individual MODIS MOD13Q1 16-day NDVI composite for
     Kathmandu Valley across the full study period (2015–2024).
-
-    GEE Collection : MODIS/061/MOD13Q1
-    Band           : NDVI  (raw int16 × 0.0001 → real NDVI in [-1, 1])
-    Resolution     : 250 m
-    Temporal res   : 16-day (finest cloud-free optical NDVI available)
-
-    Output
-    ------
-    One GeoTIFF per composite window:
-      ndvi_16day_YYYY-MM-DD.tif   ← date is the composite START date
-      ~23 composites/year × 10 years ≈ 230 tifs (~33 MB total)
-
-    Usage in feature engineering
-    ----------------------------
-    For each sample point (fire or background) with a known date D,
-    pick the composite whose start date is the closest date ≤ D.
-    This gives the pre-event vegetation state at that location.
-
-    Download strategy
-    -----------------
-    Kathmandu Valley at 250 m is ~132 × 176 pixels (~145 KB per tif) —
-    well below GEE's 32 MB direct-download limit.
-    Uses ee.Image.getDownloadURL() for a direct zip-GeoTIFF response
-    (no Google Drive export needed).
-    Falls back to a Drive export task if the direct download fails.
     """
-
     COLLECTION = "MODIS/061/MOD13Q1"
     NDVI_BAND  = "NDVI"
-    SCALE_M    = 250      # metres per pixel
-    SCALE_F    = 0.0001   # raw int16 → real NDVI
+    SCALE_M    = 250      
+    SCALE_F    = 0.0001   
 
     def __init__(self):
         self.out_dir = DATA_RAW / "ndvi"
 
     def _download_image(self, image, bbox, dest: Path, desc: str = "") -> bool:
-        """
-        Download a single GEE image as a GeoTIFF via getDownloadURL().
-        Returns True on success; falls back to a Drive export task on failure.
-        """
         import ee
 
         if dest.exists():
@@ -504,7 +366,6 @@ class NDVIExtractor:
         return False
 
     def _start_drive_export(self, image, bbox, desc: str):
-        """Start a Drive export task when direct download is unavailable."""
         import ee
         task = ee.batch.Export.image.toDrive(
             image=image,
@@ -527,11 +388,6 @@ class NDVIExtractor:
     def download_16day_composites(self):
         """
         Download every MODIS MOD13Q1 16-day composite for the study period.
-
-        Key design: composite windows are pre-computed locally (no aggregate_array /
-        size().getInfo() calls) — this eliminates hanging server-side GEE calls.
-        For each window we call collection.filterDate().first() then
-        getDownloadURL() — only one network round-trip per composite.
         """
         import ee
 
@@ -552,8 +408,6 @@ class NDVIExtractor:
                     total_cached += 1
                     continue
 
-                # Filter to this exact 16-day window and take the single image
-                # end_str + 1 day so filterDate includes the end date
                 end_exclusive = (
                     pd.Timestamp(end_str) + pd.Timedelta(days=1)
                 ).strftime("%Y-%m-%d")
@@ -563,7 +417,7 @@ class NDVIExtractor:
                     .filterBounds(bbox)
                     .filterDate(start_str, end_exclusive)
                     .select(self.NDVI_BAND)
-                    .first()                          # single image, no .getInfo()
+                    .first()                          
                     .multiply(self.SCALE_F)
                     .rename("NDVI")
                 )
@@ -582,38 +436,13 @@ class NDVIExtractor:
 
     def run(self):
         log.info("=" * 60)
-        log.info("MODULE 1 (GEE): MODIS NDVI — MOD13Q1 v6.1 (individual 16-day composites)")
-        log.info(f"  Collection : {self.COLLECTION}")
-        log.info(f"  Period     : {START_YEAR}–{END_YEAR}")
-        log.info(f"  Resolution : {self.SCALE_M} m")
-        log.info(f"  Expected   : ~{(END_YEAR - START_YEAR + 1) * 23} tifs  (~{(END_YEAR - START_YEAR + 1) * 23 * 145 // 1024} MB)")
-        log.info(f"  Output dir : {self.out_dir}")
-        log.info("=" * 60)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.download_16day_composites()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 2 — FIRMS fire hotspots via GEE (alternative to FIRMS MAP_KEY API)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class FIRMSGEEExtractor:
     """
-    Extracts NASA FIRMS MODIS fire hotspot data from GEE.
-
-    GEE Collection : FIRMS (MODIS MCD14DL, ~1 km, daily)
-    Output         : data/raw/firms/firms_gee_{year}.csv  (via Drive export)
-
-    This is an alternative to FIRMSDownloader in download_data.py.
-    It requires only a GCP project — no FIRMS MAP_KEY needed.
-
-    Export strategy
-    ---------------
-    The FIRMS ImageCollection stores one image per detection date.  To get
-    point records (lat, lon, confidence, year) we build a max-confidence
-    annual composite, sample fire pixels (confidence ≥ 50), and export to
-    Google Drive as a CSV.  After downloading from Drive, move the files to
-    data/raw/firms/.
+    Extracts NASA FIRMS MODIS fire hotspot data from GEE.   
     """
 
     COLLECTION   = "FIRMS"
@@ -638,7 +467,6 @@ class FIRMSGEEExtractor:
 
         log.info(f"  {year}: {count} FIRMS images — sampling fire pixels ...")
 
-        # Max-confidence composite for the year
         confidence_mosaic = firms.select("confidence").max()
         fire_mask         = confidence_mosaic.gte(50)
         fire_pixels       = confidence_mosaic.updateMask(fire_mask)
@@ -668,11 +496,6 @@ class FIRMSGEEExtractor:
 
     def run(self):
         log.info("=" * 60)
-        log.info("MODULE 2 (GEE): NASA FIRMS MODIS Fire Hotspots")
-        log.info(f"  Collection   : {self.COLLECTION}")
-        log.info(f"  Period       : {START_YEAR}–{END_YEAR}")
-        log.info(f"  Drive folder : {self.DRIVE_FOLDER}")
-        log.info("=" * 60)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
         task_ids = {}
@@ -688,62 +511,23 @@ class FIRMSGEEExtractor:
                 [{"year": y, "task_id": tid} for y, tid in task_ids.items()]
             ).to_csv(manifest, index=False)
             log.info(f"  Task manifest saved → {manifest.name}")
-            log.info(
-                "\n"
-                "  Next steps:\n"
-                "  1. Visit https://code.earthengine.google.com/tasks\n"
-                "  2. Wait for all FIRMS_GEE_* tasks to complete\n"
-                f" 3. Download CSVs from Google Drive → {self.DRIVE_FOLDER}/\n"
-                "  4. Move files to: data/raw/firms/\n"
-            )
         else:
             log.warning("  No FIRMS export tasks started (no fire data found).")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 3 — MODIS Burned Area MCD64A1 (monthly, 500 m)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class BurnedAreaExtractor:
     """
-    Downloads MODIS MCD64A1 v6.1 monthly burned area composites for
+    Downloads MODIS MCD64A1 monthly burned area composites for
     Kathmandu Valley across the full study period (2015–2025).
-
-    GEE Collection : MODIS/061/MCD64A1
-    Band           : BurnDate — day-of-year (1–366) of detected burn;
-                     0 = unburned; 900+ = ocean/water/unclassified.
-    Resolution     : 500 m
-    Temporal res   : Monthly
-
-    Why use this alongside FIRMS?
-    FIRMS gives point detections (thermal anomaly centroids at ~375–1000 m).
-    MCD64A1 gives *spatial burn footprints* — every 500-m pixel that was
-    confirmed burned in that calendar month.  Using both improves target-
-    variable quality: FIRMS catches small/brief fires; MCD64A1 captures
-    the full spatial extent of larger burn events.
-
-    Output
-    ------
-    One GeoTIFF per calendar month:
-      mcd64a1_{year}_{month:02d}.tif   (BurnDate band, uint16, EPSG:4326)
-      ~11 years × 12 months = 132 tifs
-
-    Download strategy
-    -----------------
-    Kathmandu Valley at 500 m is ~67 × 89 pixels — well below GEE's 32 MB
-    direct-download limit.  Uses ee.Image.getDownloadURL() for a direct
-    GeoTIFF response (no Google Drive export needed).
     """
 
     COLLECTION = "MODIS/061/MCD64A1"
     BAND       = "BurnDate"
-    SCALE_M    = 500    # metres per pixel
+    SCALE_M    = 500    
 
     def __init__(self):
         self.out_dir = DATA_RAW / "burned_area"
 
     def _download_image(self, image, bbox, dest: Path, desc: str = "") -> bool:
-        """Download a single GEE image as a GeoTIFF. Returns True on success."""
         import ee
 
         if dest.exists():
@@ -809,14 +593,6 @@ class BurnedAreaExtractor:
         import ee
 
         log.info("=" * 60)
-        log.info("MODULE 3 (GEE): MODIS Burned Area — MCD64A1 v6.1")
-        log.info(f"  Collection : {self.COLLECTION}")
-        log.info(f"  Band       : {self.BAND} (DOY of burn; 0 = unburned)")
-        log.info(f"  Period     : {START_YEAR}–{END_YEAR}")
-        log.info(f"  Resolution : {self.SCALE_M} m")
-        log.info(f"  Expected   : ~{(END_YEAR - START_YEAR + 1) * 12} monthly tifs")
-        log.info(f"  Output dir : {self.out_dir}")
-        log.info("=" * 60)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
         bbox         = _aoi_region()
@@ -833,12 +609,10 @@ class BurnedAreaExtractor:
                     total_cached += 1
                     continue
 
-                # Calendar month boundaries — no server-side size() calls
                 import calendar
                 last_day   = calendar.monthrange(year, month)[1]
                 start_str  = f"{year}-{month:02d}-01"
-                end_str    = f"{year}-{month:02d}-{last_day}"
-                # filterDate end is exclusive, so add one day
+                end_str    = f"{year}-{month:02d}-{last_day}"   
                 end_excl   = (
                     pd.Timestamp(end_str) + pd.Timedelta(days=1)
                 ).strftime("%Y-%m-%d")
@@ -866,22 +640,10 @@ class BurnedAreaExtractor:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 4 — Copernicus GLO-30 DEM (true 30 m terrain)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class DEM30Extractor:
     """
     Downloads the Copernicus GLO-30 Digital Elevation Model (~30 m) for the
     study area — the canonical terrain source for the 30 m feature stack.
-
-    GEE Collection : COPERNICUS/DEM/GLO30  (band 'DEM', metres, EGM2008)
-    Resolution     : 1 arc-second (~30 m) — matches the project's canonical grid.
-
-    Why not the on-disk SRTM?  The downloaded SRTM tile is 3 arc-second (~90 m);
-    GLO-30 gives genuine 30 m relief so slope/aspect/TRI/TWI carry real detail.
-
-    Output : data/raw/dem30/copdem30.tif  (single GeoTIFF, EPSG:4326)
     """
 
     COLLECTION = "COPERNICUS/DEM/GLO30"
@@ -894,14 +656,12 @@ class DEM30Extractor:
     def run(self):
         import ee
         log.info("=" * 60)
-        log.info("MODULE 4 (GEE): Copernicus GLO-30 DEM (true 30 m terrain)")
         log.info(f"  Collection : {self.COLLECTION}  band={self.BAND}")
         log.info(f"  Resolution : {self.SCALE_M} m   Output dir: {self.out_dir}")
         log.info("=" * 60)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
         bbox  = _aoi_region()
-        # GLO30 is an ImageCollection of 1°×1° tiles — mosaic + clip to bbox.
         image = (
             ee.ImageCollection(self.COLLECTION)
             .filterBounds(bbox)
@@ -915,21 +675,10 @@ class DEM30Extractor:
         log.info(f"  DEM30 {'saved' if ok else 'FAILED (see Drive tasks)'}: {dest.name}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 5 — Land Surface Temperature (MODIS MOD11A2)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class LSTExtractor:
     """
     Downloads fire-season (Feb–May) mean daytime Land Surface Temperature
     per year from MODIS MOD11A2 (8-day, 1 km).
-
-    GEE Collection : MODIS/061/MOD11A2  (band 'LST_Day_1km')
-    Scale factor   : 0.02 → Kelvin;  −273.15 → °C
-    Output         : data/raw/lst/lst_fire_season_{year}.tif  (°C, EPSG:4326)
-
-    LST is a strong fire-susceptibility predictor (surface dryness / heat load)
-    and is one of the methodology's novel-for-Nepal variables.
     """
 
     COLLECTION = "MODIS/061/MOD11A2"
@@ -942,7 +691,6 @@ class LSTExtractor:
     def run(self):
         import ee
         log.info("=" * 60)
-        log.info("MODULE 5 (GEE): MODIS Land Surface Temperature — MOD11A2")
         log.info(f"  Period: {START_YEAR}–{END_YEAR}  fire season {FIRE_SEASON_START}–{FIRE_SEASON_END}")
         log.info("=" * 60)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -980,12 +728,7 @@ class LSTExtractor:
         log.info(f"  LST complete — saved: {saved}, cached: {cached}, failed: {failed}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 6 — Sentinel-2 spectral indices (NBR / NDWI / EVI)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _compact_years(years):
-    """[2017,2018,2019,2023] → '2017–2019, 2023' for compact manifest logging."""
     ys = sorted(years)
     if not ys:
         return "—"
@@ -1003,37 +746,17 @@ def _compact_years(years):
 class Sentinel2Extractor:
     """
     Builds a cloud-masked fire-season Sentinel-2 composite per year and exports
-    three spectral indices as a multi-band GeoTIFF.
-
-    GEE Collection : COPERNICUS/S2_SR_HARMONIZED  (surface reflectance, 10–20 m)
-    Indices
-      NBR  = (B8 − B12) / (B8 + B12)     burn / vegetation stress
-      NDWI = (B8 − B11) / (B8 + B11)     canopy moisture (Gao / NDMI form)
-      EVI  = 2.5·(B8 − B4) / (B8 + 6·B4 − 7.5·B2 + 1)
-
-    Exported at the 100 m grid scale (aggregated from the native 10–20 m bands).
-    The province-wide 3-band image is ~90 MB, over GEE's ~50 MB direct-download
-    cap, so it is fetched as a 2×2 grid of sub-cap tiles and mosaicked locally
-    (_gee_download_tiled) — no Drive fallback / manual step required.
-
-    Output : data/raw/sentinel2/s2_{season}_{year}.tif  (bands NBR, NDWI, EVI),
-             one composite per season per year — mirrors the multi-temporal NDVI features.
+    three spectral indices as a multi-band GeoTIFF.   
     """
 
     COLLECTION = "COPERNICUS/S2_SR_HARMONIZED"
-    SCALE_M    = GRID_RES_M       # 100 m; tiled so each request fits direct download
-    N_TILES    = 2                # n×n tiles per export to stay under the 50 MB cap
-    # Fire-relevant seasons (month-day start/end, inclusive). premonsoon & fire_season
-    # mirror the NDVI windows; postmonsoon uses the Oct–Nov dry-season onset (S2 is too
-    # cloud-blocked in the Jun–Aug monsoon that NDVI's postmonsoon label uses).
+    SCALE_M    = GRID_RES_M       
+    N_TILES    = 2                
     SEASONS = {
         "premonsoon" : ("01-01", "02-28"),
         "fire_season": (FIRE_SEASON_START, FIRE_SEASON_END),
         "postmonsoon": ("10-01", "11-30"),
     }
-    # COPERNICUS/S2_SR_HARMONIZED surface-reflectance archive begins 2017-03-28.
-    # Any window that *ends* before this is expectedly empty (e.g. premonsoon 2017,
-    # Jan 1–Feb 28) — flagged KNOWN-EMPTY in the manifest, not counted as a gap.
     S2_SR_START = pd.Timestamp("2017-03-28")
 
     def __init__(self):
@@ -1041,7 +764,6 @@ class Sentinel2Extractor:
 
     @staticmethod
     def _mask_clouds(img):
-        """Mask clouds/cirrus using the QA60 bitmask (bits 10 & 11)."""
         import ee
         qa = img.select("QA60")
         cloud_bit  = 1 << 10
@@ -1050,7 +772,7 @@ class Sentinel2Extractor:
             qa.bitwiseAnd(cloud_bit).eq(0)
             .And(qa.bitwiseAnd(cirrus_bit).eq(0))
         )
-        return img.updateMask(mask).divide(10000)   # scale reflectance to 0–1
+        return img.updateMask(mask).divide(10000)   
 
     def _indices(self, composite):
         nbr  = composite.normalizedDifference(["B8", "B12"]).rename("NBR")
@@ -1063,15 +785,11 @@ class Sentinel2Extractor:
                 "BLUE": composite.select("B2"),
             },
         ).rename("EVI")
-        # Cast to a uniform Float32: normalizedDifference yields Float32 but the
-        # EVI expression yields Float64, and a mixed-dtype image makes
-        # Export.toDrive fail ("bands must have compatible data types").
         return nbr.addBands(ndwi).addBands(evi).toFloat()
 
     def run(self):
         import ee
         log.info("=" * 60)
-        log.info("MODULE 6 (GEE): Sentinel-2 spectral indices — NBR / NDWI / EVI")
         log.info(f"  Period: {START_YEAR}–{END_YEAR}  export scale {self.SCALE_M} m")
         log.info("=" * 60)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -1079,14 +797,9 @@ class Sentinel2Extractor:
         today = pd.Timestamp.today().normalize()
         years = list(range(max(START_YEAR, 2017), END_YEAR + 1))
 
-        # ── 1. Manifest: classify every (season, year) BEFORE downloading ──────
-        # CACHED       file already on disk
-        # FUTURE-SKIP  window end-date is still in the future (data not yet collected)
-        # KNOWN-EMPTY  window ends before the S2_SR archive begins (2017-03-28)
-        # TO-DOWNLOAD  a real, fetchable gap we will attempt this pass
         manifest = {s: {"CACHED": [], "TO-DOWNLOAD": [],
                         "FUTURE-SKIP": [], "KNOWN-EMPTY": []} for s in self.SEASONS}
-        todo = []   # (season, year, start, end_excl, dest) for each TO-DOWNLOAD
+        todo = []   
         for season, (s_md, e_md) in self.SEASONS.items():
             for year in years:
                 dest    = self.out_dir / f"s2_{season}_{year}.tif"
@@ -1102,15 +815,12 @@ class Sentinel2Extractor:
                     todo.append((season, year, f"{year}-{s_md}", end_excl, dest))
                     manifest[season]["TO-DOWNLOAD"].append(year)
 
-        log.info("  ┌─ Sentinel-2 manifest  (season · status → years) ───────────")
         for season in self.SEASONS:
             for status in ("CACHED", "TO-DOWNLOAD", "FUTURE-SKIP", "KNOWN-EMPTY"):
                 yrs = manifest[season][status]
                 if yrs:
                     log.info(f"  │  {season:<11} {status:<12} {_compact_years(yrs)}")
-        log.info(f"  └─ {len(todo)} mosaic(s) to download this pass")
 
-        # ── 2. Download loop — each mosaic isolated so one failure ≠ run death ──
         bbox = _aoi_region()
         saved, empty, failed = 0, [], []
         for i, (season, year, start, end_excl, dest) in enumerate(todo, 1):
@@ -1144,54 +854,22 @@ class Sentinel2Extractor:
                 log.error(f"      ✗ {name} crashed: {exc!r} — continuing to next mosaic")
             time.sleep(1)
 
-        # ── 3. Gap report — explicit, names the real gaps that remain ──────────
-        real = [(s, y) for s in self.SEASONS for y in
-                manifest[s]["CACHED"] + manifest[s]["TO-DOWNLOAD"]]
-        still_missing = [f"s2_{s}_{y}" for s, y in real
-                         if not (self.out_dir / f"s2_{s}_{y}.tif").exists()]
-        log.info("  ┌─ Sentinel-2 run summary ───────────────────────────────────")
         log.info(f"  │  saved this pass : {saved}")
         log.info(f"  │  empty windows   : {len(empty)}  {empty or ''}")
         log.info(f"  │  failed this pass: {len(failed)}  {failed or ''}")
-        log.info(f"  │  present / real  : {len(real) - len(still_missing)}/{len(real)} mosaics")
-        if still_missing:
-            log.warning(f"  │  REAL GAPS REMAIN ({len(still_missing)}): {still_missing}")
-            log.warning("  │  → re-run `gee_extractor.py --module sentinel2` to mop up")
-        else:
-            log.info("  │  no real gaps remain ✓  (future / known-empty windows excluded)")
-        log.info("  └────────────────────────────────────────────────────────────")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 6b — Sentinel-2 spectral indices as 16-day composites (NDVI-aligned)
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Sentinel2SixteenDayExtractor(Sentinel2Extractor):
     """
     Sentinel-2 NBR/NDWI/EVI at the SAME 16-day cadence as the MODIS NDVI series
     (`_modis_16day_windows`), one composite per window → data/raw/sentinel2-16/.
-
-    Reuses every building block of the seasonal `Sentinel2Extractor` (cloud mask,
-    index math, 2×2 tiled download); only the output dir and the per-window loop
-    differ. Output: s2_16day_<window-start>.tif (bands NBR, NDWI, EVI) — the S2
-    analogue of ndvi_16day_<start>.tif, 1:1-alignable with it by start date.
-
-    NOTE: a 16-day window has far fewer cloud-free S2 scenes than a seasonal
-    composite, so many windows (esp. the Jun–Sep monsoon) return zero scenes and
-    are logged + skipped — expected sparsity, not a failure.
     """
 
-    # Legit windows finish in well under ~90 s (4 tiles). Anything past this cap is
-    # a hung EE RPC, not heavy compute — abandon it and let the driver retry.
     WINDOW_CAP_S = 240
 
     def __init__(self):
         self.out_dir = S2_16_DIR
 
     def _fetch_window(self, ee, start, end_excl, dest, name, bbox):
-        """Fetch ONE 16-day window. Returns 'saved' | 'empty' | 'failed'.
-        Runs inside a daemon watchdog thread (see run) so a hung getInfo /
-        getDownloadURL can never freeze the whole extraction."""
         coll = (
             ee.ImageCollection(self.COLLECTION)
             .filterBounds(bbox)
@@ -1207,23 +885,16 @@ class Sentinel2SixteenDayExtractor(Sentinel2Extractor):
         return "saved" if ok else "failed"
 
     def run(self):
-        import ee
         import socket
         import threading
-        # EE getInfo()/getDownloadURL intermittently hang with no client read
-        # timeout. No single deadline fits every case (a generous one makes genuine
-        # hangs grind via EE's internal retries; a tight one cuts off slow windows),
-        # so the real defence is a per-window WALL-CLOCK CAP: each window runs in a
-        # daemon thread we join with a timeout; if it overruns WINDOW_CAP_S it is
-        # abandoned (the daemon thread dies at process exit, so it can't block the
-        # run) and the multi-pass driver retries it. socket/deadline are secondary.
-        socket.setdefaulttimeout(150)              # client-side read timeout (s)
+
+        import ee
+        socket.setdefaulttimeout(150)              
         try:
-            ee.data.setDeadline(120_000)           # EE RPC deadline (ms)
+            ee.data.setDeadline(120_000)           
         except Exception as exc:
             log.warning(f"  could not set EE request deadline ({exc!r})")
         log.info("=" * 60)
-        log.info("MODULE 6b (GEE): Sentinel-2 16-day composites — NBR / NDWI / EVI")
         log.info(f"  Period: {max(START_YEAR, 2017)}–{END_YEAR}  "
                  f"export scale {self.SCALE_M} m  (windows aligned to MODIS NDVI)")
         log.info("=" * 60)
@@ -1231,10 +902,7 @@ class Sentinel2SixteenDayExtractor(Sentinel2Extractor):
 
         today = pd.Timestamp.today().normalize()
 
-        # ── 1. Manifest: classify every 16-day window before downloading ──────
-        #   CACHED file exists · FUTURE-SKIP window not begun · KNOWN-EMPTY ends
-        #   before the S2_SR archive (2017-03-28) · TO-DOWNLOAD a real fetch.
-        todo = []                       # (start, end_excl, dest) per TO-DOWNLOAD window
+        todo = []                       
         n_cached = n_known = n_future = 0
         for year in range(max(START_YEAR, 2017), END_YEAR + 1):
             windows = _modis_16day_windows(year)
@@ -1256,10 +924,7 @@ class Sentinel2SixteenDayExtractor(Sentinel2Extractor):
             n_cached += y_cached; n_known += y_known; n_future += y_future
             log.info(f"  {year}: {len(windows):2d} win — cached {y_cached}, "
                      f"to-dl {y_todo}, known-empty {y_known}, future {y_future}")
-        log.info(f"  └─ {len(todo)} window(s) to download this pass "
-                 f"(cached {n_cached}, known-empty {n_known}, future {n_future})")
 
-        # ── 2. Download loop — each window under a hard wall-clock cap ─────────
         bbox = _aoi_region()
         saved, empty, failed = 0, [], []
         for i, (start, end_excl, dest) in enumerate(todo, 1):
@@ -1295,58 +960,21 @@ class Sentinel2SixteenDayExtractor(Sentinel2Extractor):
                               + (f": {box['err']}" if "err" in box else ""))
             time.sleep(1)
 
-        # ── 3. Gap report — empties are expected, NOT counted as real gaps ─────
-        empty_set = set(empty)
-        still_missing = [f"s2_16day_{s}" for (s, _e, d) in todo
-                         if not d.exists() and f"s2_16day_{s}" not in empty_set]
-        log.info("  ┌─ Sentinel-2 16-day run summary ────────────────────────────")
         log.info(f"  │  saved this pass : {saved}")
         log.info(f"  │  empty windows   : {len(empty)} (no cloud-free scenes — expected)")
         log.info(f"  │  failed this pass: {len(failed)}  {failed or ''}")
-        if still_missing:
-            log.warning(f"  │  REAL GAPS REMAIN ({len(still_missing)}): {still_missing}")
-            log.warning("  │  → re-run `gee_extractor.py --module sentinel2_16day` to mop up")
-        else:
-            log.info("  │  no real gaps remain ✓  (empty / future / known-empty excluded)")
-        log.info("  └────────────────────────────────────────────────────────────")
+        
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 7 — Gridded fire-season climate (ERA5-Land + CHIRPS)
-# ─────────────────────────────────────────────────────────────────────────────
 
 class ClimateExtractor:
     """
     Gridded fire-season (Feb–May) climate per year as a 6-band raster.
-
-    This replaces the old single-point Open-Meteo weather: at province scale a
-    single point cannot represent Bagmati's Terai-to-Himal climate gradient, so
-    climate must be spatial.
-
-    Sources (Google Earth Engine)
-      ERA5-Land daily aggregates  ECMWF/ERA5_LAND/DAILY_AGGR   (temp, wind ~11 km)
-      CHIRPS daily precipitation  UCSB-CHG/CHIRPS/DAILY        (precip ~5.5 km)
-
-    Bands — order MUST match feature_engineering.CLIMATE_BANDS:
-      1 temp_max_mean_c        mean daily Tmax over the season (°C)
-      2 wind_max_mean_kmh      mean daily 10 m wind speed (km/h)
-      3 precip_fire_season_mm  total season precipitation (mm)
-      4 drought_factor         1/(1+P/100) season dryness (0–1)
-      5 fwi_proxy              T·W·drought/(1+P/30) fire-weather proxy
-      6 consec_dry_days_max    longest run of days with < 1 mm precip
-
-    The derived indices (drought_factor, fwi_proxy) are season-scale proxies of
-    the daily formulas used in the valley pipeline — adequate for static
-    susceptibility; the prediction phase will compute a true daily FWI.
-
     Output : data/raw/climate/climate_fire_season_{year}.tif  (EPSG:4326)
-    Native climate is coarse, so it is exported at SCALE_M and upsampled onto the
-    100 m grid by feature_engineering.align_raster.
     """
 
     ERA5    = "ECMWF/ERA5_LAND/DAILY_AGGR"
     CHIRPS  = "UCSB-CHG/CHIRPS/DAILY"
-    SCALE_M = 5000   # climate fields are smooth; upsampled to the grid locally
+    SCALE_M = 5000   
 
     def __init__(self):
         self.out_dir = DATA_RAW / "climate"
@@ -1377,8 +1005,6 @@ class ClimateExtractor:
             {"T": tmax_c, "W": wind_kmh, "D": drought, "P": precip_mm},
         ).rename("fwi_proxy")
 
-        # Longest consecutive dry-day run (daily precip < 1 mm) via iterate:
-        #   run = (prev_run + dry) * dry   → +1 while dry, reset to 0 when wet
         dry = chirps.map(lambda img: ee.Image(img).lt(1.0).rename("dry").toFloat())
         init = ee.Image(0).rename("run").addBands(ee.Image(0).rename("max")).toFloat()
 
@@ -1396,11 +1022,6 @@ class ClimateExtractor:
                 .toFloat().clip(region))
 
     def run(self):
-        log.info("=" * 60)
-        log.info("MODULE 7 (GEE): Gridded fire-season climate (ERA5-Land + CHIRPS)")
-        log.info(f"  Period : {START_YEAR}–{END_YEAR}  fire season {FIRE_SEASON_START}–{FIRE_SEASON_END}")
-        log.info(f"  Bands  : temp/wind/precip/drought/fwi/consec_dry  scale {self.SCALE_M} m")
-        log.info(f"  Output : {self.out_dir}")
         log.info("=" * 60)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1427,10 +1048,6 @@ class ClimateExtractor:
         log.info(f"  Climate complete — saved: {saved}, cached: {cached}, failed: {failed}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(
         description="GEE data extractor for forest fire susceptibility project",
@@ -1438,14 +1055,7 @@ def main():
         epilog="""
 Examples:
   uv run python scripts/gee_extractor.py --authenticate
-  uv run python scripts/gee_extractor.py --module dem30
-  uv run python scripts/gee_extractor.py --module ndvi
-  uv run python scripts/gee_extractor.py --module lst
-  uv run python scripts/gee_extractor.py --module sentinel2
-  uv run python scripts/gee_extractor.py --module sentinel2_16day   # 16-day S2, NOT in --module all
-  uv run python scripts/gee_extractor.py --module firms
-  uv run python scripts/gee_extractor.py --module burned_area
-  uv run python scripts/gee_extractor.py --module all
+  uv run python scripts/gee_extractor.py --module dem30/ndvi/lst/sentinel2/sentinel2_16day/firms/burned_area/climate/all
         """,
     )
     parser.add_argument(
@@ -1488,7 +1098,6 @@ Examples:
     if args.module in ("sentinel2", "all"):
         Sentinel2Extractor().run()
 
-    # 16-day Sentinel-2 is heavy (~230 composites) and opt-in — NOT part of 'all'.
     if args.module == "sentinel2_16day":
         Sentinel2SixteenDayExtractor().run()
 
