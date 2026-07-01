@@ -8,7 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
-
+.claude/
 # Credentials
 .env
 
@@ -21,3 +21,5 @@ logs/
 
 # Model artifacts & rasters — regenerable from the training notebooks, too large for git
 *.tif
+*.pdf
+*.pptx
